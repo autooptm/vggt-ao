@@ -231,8 +231,16 @@ def batch_np_matrix_to_pycolmap_wo_track(
     # Reconstruction object, following the format of PyCOLMAP/COLMAP
     reconstruction = pycolmap.Reconstruction()
 
-    for vidx in range(P):
-        reconstruction.add_point3D(points3d[vidx], pycolmap.Track(), points_rgb[vidx])
+    # Every point belongs to exactly one frame (points_xyf carries the frame index),
+    # so each track has exactly one element and can be built when the point is added
+    # (below, after the images exist). That removes the second walk over all P points
+    # this function used to do, which looked each point3D back up in the
+    # reconstruction just to reach its track.
+    frame_of = points_xyf[:, 2].astype(np.int64)
+    frame_order = np.argsort(frame_of, kind="stable")
+    frame_starts = np.concatenate(([0], np.cumsum(np.bincount(frame_of, minlength=N))))
+    point2D_idx_of = np.empty(P, dtype=np.int64)
+    point2D_idx_of[frame_order] = np.arange(P) - frame_starts[frame_of[frame_order]]
 
     camera = None
     # frame idx
@@ -257,25 +265,14 @@ def batch_np_matrix_to_pycolmap_wo_track(
             id=fidx + 1, name=f"image_{fidx + 1}", camera_id=camera.camera_id, cam_from_world=cam_from_world
         )
 
-        points2D_list = []
+        # the frame's points, in the same order the track elements above assumed
+        points_belong_to_fidx = frame_order[frame_starts[fidx] : frame_starts[fidx + 1]]
+        frame_xy = points_xyf[points_belong_to_fidx, :2]
 
-        point2D_idx = 0
-
-        points_belong_to_fidx = points_xyf[:, 2].astype(np.int32) == fidx
-        points_belong_to_fidx = np.nonzero(points_belong_to_fidx)[0]
-
-        for point3D_batch_idx in points_belong_to_fidx:
-            point3D_id = point3D_batch_idx + 1
-            point2D_xyf = points_xyf[point3D_batch_idx]
-            point2D_xy = point2D_xyf[:2]
-            points2D_list.append(pycolmap.Point2D(point2D_xy, point3D_id))
-
-            # add element
-            track = reconstruction.points3D[point3D_id].track
-            track.add_element(fidx + 1, point2D_idx)
-            point2D_idx += 1
-
-        assert point2D_idx == len(points2D_list)
+        # Deliberately WITHOUT a point3D id: add_point3D below is what links each
+        # observation to its point, and it refuses to link one that already has a
+        # point3D (Reconstruction::AddPoint3D, reconstruction.cc:143).
+        points2D_list = [pycolmap.Point2D(xy) for xy in frame_xy]
 
         try:
             image.points2D = pycolmap.ListPoint2D(points2D_list)
@@ -286,6 +283,15 @@ def batch_np_matrix_to_pycolmap_wo_track(
 
         # add image
         reconstruction.add_image(image)
+
+    # Points last: a track element names an image AND an index into that image's
+    # points2D, and add_point3D resolves both when the point is added, so the images
+    # and their observations both have to be in the reconstruction first. Point ids
+    # come out 1..P in this order, which is what points2D above assumes.
+    for vidx in range(P):
+        track = pycolmap.Track()
+        track.add_element(int(frame_of[vidx]) + 1, int(point2D_idx_of[vidx]))
+        reconstruction.add_point3D(points3d[vidx], track, points_rgb[vidx])
 
     return reconstruction
 

@@ -1,4 +1,64 @@
 <div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>vggt · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>1.58x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-1.58x-2ea44f"></a>
+    <a href="https://github.com/facebookresearch/vggt/commit/a288dd0f14786c93483e45524328726ab7b1b4ce"><img alt="base" src="https://img.shields.io/badge/upstream-a288dd0f1478-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [facebookresearch/vggt](https://github.com/facebookresearch/vggt) at commit
+> [`a288dd0f1478`](https://github.com/facebookresearch/vggt/commit/a288dd0f14786c93483e45524328726ab7b1b4ce) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result
+
+| | |
+|---|---|
+| **Command** | `python demo_colmap.py --scene_dir=examples/kitchen` |
+| **Entry point** | `demo_colmap.py` |
+| **Unit measured** | one scene reconstruction as `demo_colmap.py` does it: image decode → VGGT-1B cameras and depth → unprojection → COLMAP reconstruction. Measured over the repository's example scenes `kitchen`, `llff_fern` and `room`, 3 rounds after a warm-up round, in one process with the model loaded once |
+| **Before (stock)** | 3,273 ms per scene (kitchen 4,323 ms, llff_fern 3,540 ms, room 1,954 ms) |
+| **After (this tree, all switches default ON)** | 2,069 ms per scene (kitchen 2,849 ms, llff_fern 2,288 ms, room 1,070 ms; the model load and the warm-up round are not included) |
+| **Speedup** | **1.58x** end to end on RTX 4090, noise floor of the host 1.7% |
+| **Output** | the world point cloud the program writes, weighted at its own confidence threshold, matches the stock program's at PSNR 97.2 dB (relative L2 1.8e-4; 7.3e-5 on held-out scenes). Not bit-exact: the 100k points handed to COLMAP are a different seeded random draw from the same set of confident points |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `demo_colmap.py` | demo_fn() -- COLMAP point coordinates | 1.118x |
+| `demo_colmap.py` | run_VGGT() / demo_fn() -- post-processing | 1.067x |
+| `vggt/utils/geometry.py` | unproject_depth_map_to_point_map() | 1.067x |
+| `vggt/utils/helper.py` | select_confident_points() (new) | 1.067x |
+| `vggt/utils/load_fn.py` | load_and_preprocess_images_square() | 1.040x |
+| `vggt/dependency/np_to_pycolmap.py` | batch_np_matrix_to_pycolmap_wo_track() | 1.034x |
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/vggt-ao.git
+cd vggt-ao
+# set up exactly as upstream documents (the VGGT-1B checkpoint downloads on first run), then:
+python demo_colmap.py --scene_dir=examples/kitchen
+```
+
+The diff against upstream is one commit: `git log -1 -p` shows it, and
+`git diff a288dd0f1478` is the same patch as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
+<div align="center">
 <h1>VGGT: Visual Geometry Grounded Transformer</h1>
 
 <a href="https://jytime.github.io/data/VGGT_CVPR25.pdf" target="_blank" rel="noopener noreferrer">

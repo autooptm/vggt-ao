@@ -27,7 +27,7 @@ from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images_square
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map
-from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
+from vggt.utils.helper import select_confident_points
 from vggt.dependency.track_predict import predict_tracks
 from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap, batch_np_matrix_to_pycolmap_wo_track
 
@@ -83,11 +83,7 @@ def run_VGGT(model, images, dtype, resolution=518):
         # Predict Depth Maps
         depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
 
-    extrinsic = extrinsic.squeeze(0).cpu().numpy()
-    intrinsic = intrinsic.squeeze(0).cpu().numpy()
-    depth_map = depth_map.squeeze(0).cpu().numpy()
-    depth_conf = depth_conf.squeeze(0).cpu().numpy()
-    return extrinsic, intrinsic, depth_map, depth_conf
+    return extrinsic.squeeze(0), intrinsic.squeeze(0), depth_map.squeeze(0), depth_conf.squeeze(0)
 
 
 def demo_fn(args):
@@ -112,7 +108,10 @@ def demo_fn(args):
     # Run VGGT for camera and depth estimation
     model = VGGT()
     _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
+    # Read the checkpoint straight onto the device and adopt its tensors instead of
+    # copying them into the freshly constructed ones: same weights, one 5 GB host
+    # copy and one host-to-device pass fewer.
+    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL, map_location=device), assign=True)
     model.eval()
     model = model.to(device)
     print(f"Model loaded")
@@ -137,9 +136,15 @@ def demo_fn(args):
     # Run VGGT to estimate camera and depth
     # Run with 518x518 images
     extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution)
-    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
+    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic, return_tensor=True)
+    extrinsic = extrinsic.cpu().numpy()
+    intrinsic = intrinsic.cpu().numpy()
+
+    shift_point2d_to_original_res = True
 
     if args.use_ba:
+        points_3d = points_3d.cpu().numpy()
+        depth_conf = depth_conf.cpu().numpy()
         image_size = np.array(images.shape[-2:])
         scale = img_load_resolution / vggt_fixed_resolution
         shared_camera = args.shared_camera
@@ -198,24 +203,31 @@ def demo_fn(args):
         camera_type = "PINHOLE"  # in the feedforward manner, we only support PINHOLE camera
 
         image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
-        num_frames, height, width, _ = points_3d.shape
 
         points_rgb = F.interpolate(
             images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
         )
-        points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8)
-        points_rgb = points_rgb.transpose(0, 2, 3, 1)
+        points_rgb = (points_rgb * 255).to(torch.uint8).permute(0, 2, 3, 1).contiguous()
 
-        # (S, H, W, 3), with x, y coordinates and frame indices
-        points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
+        # at most writing 100000 3d points to colmap reconstruction object; the
+        # threshold, the cap and the gather all run where the tensors already are
+        points_3d, points_xyf, points_rgb = select_confident_points(
+            points_3d, depth_conf, points_rgb, conf_thres_value, max_points_for_colmap, seed=args.seed
+        )
 
-        conf_mask = depth_conf >= conf_thres_value
-        # at most writing 100000 3d points to colmap reconstruction object
-        conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
-
-        points_3d = points_3d[conf_mask]
-        points_xyf = points_xyf[conf_mask]
-        points_rgb = points_rgb[conf_mask]
+        # Map the 2D coordinates back to the original image resolution HERE, while
+        # they are still a numpy array. rename_colmap_recons_and_rescale_camera
+        # applies the same per-image affine below, but one Point2D at a time across
+        # the pybind boundary; folding it in is the same arithmetic on 100k rows at
+        # once. (Only for the feed-forward branch, whose shared_camera is False --
+        # the BA branch keeps the original path.)
+        original_coords_np = original_coords.cpu().numpy()
+        frame_of_point = points_xyf[:, 2].astype(np.int64)
+        per_frame_ratio = original_coords_np[:, -2:].max(axis=1) / vggt_fixed_resolution
+        points_xyf[:, :2] = (
+            points_xyf[:, :2] - original_coords_np[frame_of_point, :2]
+        ) * per_frame_ratio[frame_of_point, None]
+        shift_point2d_to_original_res = False
 
         print("Converting to COLMAP format")
         reconstruction = batch_np_matrix_to_pycolmap_wo_track(
@@ -236,7 +248,7 @@ def demo_fn(args):
         base_image_path_list,
         original_coords.cpu().numpy(),
         img_size=reconstruction_resolution,
-        shift_point2d_to_original_res=True,
+        shift_point2d_to_original_res=shift_point2d_to_original_res,
         shared_camera=shared_camera,
     )
 

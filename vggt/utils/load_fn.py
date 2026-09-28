@@ -4,13 +4,59 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
 from PIL import Image
 from torchvision import transforms as TF
 import numpy as np
 
 
-def load_and_preprocess_images_square(image_path_list, target_size=1024):
+def _load_and_pad_square(image_path, target_size):
+    to_tensor = TF.ToTensor()
+
+    # Open image
+    img = Image.open(image_path)
+
+    # If there's an alpha channel, blend onto white background
+    if img.mode == "RGBA":
+        background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        img = Image.alpha_composite(background, img)
+
+    # Convert to RGB
+    img = img.convert("RGB")
+
+    # Get original dimensions
+    width, height = img.size
+
+    # Make the image square by padding the shorter dimension
+    max_dim = max(width, height)
+
+    # Calculate padding
+    left = (max_dim - width) // 2
+    top = (max_dim - height) // 2
+
+    # Calculate scale factor for resizing
+    scale = target_size / max_dim
+
+    # Calculate final coordinates of original image in target space
+    x1 = left * scale
+    y1 = top * scale
+    x2 = (left + width) * scale
+    y2 = (top + height) * scale
+
+    # Create a new black square image and paste original
+    square_img = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
+    square_img.paste(img, (left, top))
+
+    # Resize to target size
+    square_img = square_img.resize((target_size, target_size), Image.Resampling.BICUBIC)
+
+    return to_tensor(square_img), np.array([x1, y1, x2, y2, width, height])
+
+
+def load_and_preprocess_images_square(image_path_list, target_size=1024, num_threads=None):
     """
     Load and preprocess images by center padding to square and resizing to target size.
     Also returns the position information of original pixels after transformation.
@@ -18,6 +64,8 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
     Args:
         image_path_list (list): List of paths to image files
         target_size (int, optional): Target size for both width and height. Defaults to 518.
+        num_threads (int, optional): Threads used to decode and resize. Defaults to
+            one per image, capped at 16 and at the core count. Pass 1 to load serially.
 
     Returns:
         tuple: (
@@ -32,58 +80,17 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
     if len(image_path_list) == 0:
         raise ValueError("At least 1 image is required")
 
-    images = []
-    original_coords = []  # Renamed from position_info to be more descriptive
-    to_tensor = TF.ToTensor()
-
-    for image_path in image_path_list:
-        # Open image
-        img = Image.open(image_path)
-
-        # If there's an alpha channel, blend onto white background
-        if img.mode == "RGBA":
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            img = Image.alpha_composite(background, img)
-
-        # Convert to RGB
-        img = img.convert("RGB")
-
-        # Get original dimensions
-        width, height = img.size
-
-        # Make the image square by padding the shorter dimension
-        max_dim = max(width, height)
-
-        # Calculate padding
-        left = (max_dim - width) // 2
-        top = (max_dim - height) // 2
-
-        # Calculate scale factor for resizing
-        scale = target_size / max_dim
-
-        # Calculate final coordinates of original image in target space
-        x1 = left * scale
-        y1 = top * scale
-        x2 = (left + width) * scale
-        y2 = (top + height) * scale
-
-        # Store original image coordinates and scale
-        original_coords.append(np.array([x1, y1, x2, y2, width, height]))
-
-        # Create a new black square image and paste original
-        square_img = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
-        square_img.paste(img, (left, top))
-
-        # Resize to target size
-        square_img = square_img.resize((target_size, target_size), Image.Resampling.BICUBIC)
-
-        # Convert to tensor
-        img_tensor = to_tensor(square_img)
-        images.append(img_tensor)
+    if num_threads is None:
+        num_threads = min(16, len(image_path_list), os.cpu_count() or 8)
+    if num_threads > 1:
+        with ThreadPoolExecutor(max_workers=num_threads) as pool:
+            loaded = list(pool.map(lambda p: _load_and_pad_square(p, target_size), image_path_list))
+    else:
+        loaded = [_load_and_pad_square(p, target_size) for p in image_path_list]
 
     # Stack all images
-    images = torch.stack(images)
-    original_coords = torch.from_numpy(np.array(original_coords)).float()
+    images = torch.stack([img_tensor for img_tensor, _ in loaded])
+    original_coords = torch.from_numpy(np.array([coords for _, coords in loaded])).float()
 
     # Add additional dimension if single image to ensure correct shape
     if len(image_path_list) == 1:

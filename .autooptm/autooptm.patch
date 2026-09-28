@@ -1,0 +1,447 @@
+diff --git a/demo_colmap.py b/demo_colmap.py
+index 836af17..bd1d337 100644
+--- a/demo_colmap.py
++++ b/demo_colmap.py
+@@ -27,7 +27,7 @@ from vggt.models.vggt import VGGT
+ from vggt.utils.load_fn import load_and_preprocess_images_square
+ from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+ from vggt.utils.geometry import unproject_depth_map_to_point_map
+-from vggt.utils.helper import create_pixel_coordinate_grid, randomly_limit_trues
++from vggt.utils.helper import select_confident_points
+ from vggt.dependency.track_predict import predict_tracks
+ from vggt.dependency.np_to_pycolmap import batch_np_matrix_to_pycolmap, batch_np_matrix_to_pycolmap_wo_track
+ 
+@@ -83,11 +83,7 @@ def run_VGGT(model, images, dtype, resolution=518):
+         # Predict Depth Maps
+         depth_map, depth_conf = model.depth_head(aggregated_tokens_list, images, ps_idx)
+ 
+-    extrinsic = extrinsic.squeeze(0).cpu().numpy()
+-    intrinsic = intrinsic.squeeze(0).cpu().numpy()
+-    depth_map = depth_map.squeeze(0).cpu().numpy()
+-    depth_conf = depth_conf.squeeze(0).cpu().numpy()
+-    return extrinsic, intrinsic, depth_map, depth_conf
++    return extrinsic.squeeze(0), intrinsic.squeeze(0), depth_map.squeeze(0), depth_conf.squeeze(0)
+ 
+ 
+ def demo_fn(args):
+@@ -112,7 +108,10 @@ def demo_fn(args):
+     # Run VGGT for camera and depth estimation
+     model = VGGT()
+     _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
+-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
++    # Read the checkpoint straight onto the device and adopt its tensors instead of
++    # copying them into the freshly constructed ones: same weights, one 5 GB host
++    # copy and one host-to-device pass fewer.
++    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL, map_location=device), assign=True)
+     model.eval()
+     model = model.to(device)
+     print(f"Model loaded")
+@@ -137,9 +136,15 @@ def demo_fn(args):
+     # Run VGGT to estimate camera and depth
+     # Run with 518x518 images
+     extrinsic, intrinsic, depth_map, depth_conf = run_VGGT(model, images, dtype, vggt_fixed_resolution)
+-    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic)
++    points_3d = unproject_depth_map_to_point_map(depth_map, extrinsic, intrinsic, return_tensor=True)
++    extrinsic = extrinsic.cpu().numpy()
++    intrinsic = intrinsic.cpu().numpy()
++
++    shift_point2d_to_original_res = True
+ 
+     if args.use_ba:
++        points_3d = points_3d.cpu().numpy()
++        depth_conf = depth_conf.cpu().numpy()
+         image_size = np.array(images.shape[-2:])
+         scale = img_load_resolution / vggt_fixed_resolution
+         shared_camera = args.shared_camera
+@@ -198,24 +203,31 @@ def demo_fn(args):
+         camera_type = "PINHOLE"  # in the feedforward manner, we only support PINHOLE camera
+ 
+         image_size = np.array([vggt_fixed_resolution, vggt_fixed_resolution])
+-        num_frames, height, width, _ = points_3d.shape
+ 
+         points_rgb = F.interpolate(
+             images, size=(vggt_fixed_resolution, vggt_fixed_resolution), mode="bilinear", align_corners=False
+         )
+-        points_rgb = (points_rgb.cpu().numpy() * 255).astype(np.uint8)
+-        points_rgb = points_rgb.transpose(0, 2, 3, 1)
+-
+-        # (S, H, W, 3), with x, y coordinates and frame indices
+-        points_xyf = create_pixel_coordinate_grid(num_frames, height, width)
++        points_rgb = (points_rgb * 255).to(torch.uint8).permute(0, 2, 3, 1).contiguous()
+ 
+-        conf_mask = depth_conf >= conf_thres_value
+-        # at most writing 100000 3d points to colmap reconstruction object
+-        conf_mask = randomly_limit_trues(conf_mask, max_points_for_colmap)
++        # at most writing 100000 3d points to colmap reconstruction object; the
++        # threshold, the cap and the gather all run where the tensors already are
++        points_3d, points_xyf, points_rgb = select_confident_points(
++            points_3d, depth_conf, points_rgb, conf_thres_value, max_points_for_colmap, seed=args.seed
++        )
+ 
+-        points_3d = points_3d[conf_mask]
+-        points_xyf = points_xyf[conf_mask]
+-        points_rgb = points_rgb[conf_mask]
++        # Map the 2D coordinates back to the original image resolution HERE, while
++        # they are still a numpy array. rename_colmap_recons_and_rescale_camera
++        # applies the same per-image affine below, but one Point2D at a time across
++        # the pybind boundary; folding it in is the same arithmetic on 100k rows at
++        # once. (Only for the feed-forward branch, whose shared_camera is False --
++        # the BA branch keeps the original path.)
++        original_coords_np = original_coords.cpu().numpy()
++        frame_of_point = points_xyf[:, 2].astype(np.int64)
++        per_frame_ratio = original_coords_np[:, -2:].max(axis=1) / vggt_fixed_resolution
++        points_xyf[:, :2] = (
++            points_xyf[:, :2] - original_coords_np[frame_of_point, :2]
++        ) * per_frame_ratio[frame_of_point, None]
++        shift_point2d_to_original_res = False
+ 
+         print("Converting to COLMAP format")
+         reconstruction = batch_np_matrix_to_pycolmap_wo_track(
+@@ -236,7 +248,7 @@ def demo_fn(args):
+         base_image_path_list,
+         original_coords.cpu().numpy(),
+         img_size=reconstruction_resolution,
+-        shift_point2d_to_original_res=True,
++        shift_point2d_to_original_res=shift_point2d_to_original_res,
+         shared_camera=shared_camera,
+     )
+ 
+diff --git a/vggt/dependency/np_to_pycolmap.py b/vggt/dependency/np_to_pycolmap.py
+index 61ea578..440b22e 100644
+--- a/vggt/dependency/np_to_pycolmap.py
++++ b/vggt/dependency/np_to_pycolmap.py
+@@ -231,8 +231,16 @@ def batch_np_matrix_to_pycolmap_wo_track(
+     # Reconstruction object, following the format of PyCOLMAP/COLMAP
+     reconstruction = pycolmap.Reconstruction()
+ 
+-    for vidx in range(P):
+-        reconstruction.add_point3D(points3d[vidx], pycolmap.Track(), points_rgb[vidx])
++    # Every point belongs to exactly one frame (points_xyf carries the frame index),
++    # so each track has exactly one element and can be built when the point is added
++    # (below, after the images exist). That removes the second walk over all P points
++    # this function used to do, which looked each point3D back up in the
++    # reconstruction just to reach its track.
++    frame_of = points_xyf[:, 2].astype(np.int64)
++    frame_order = np.argsort(frame_of, kind="stable")
++    frame_starts = np.concatenate(([0], np.cumsum(np.bincount(frame_of, minlength=N))))
++    point2D_idx_of = np.empty(P, dtype=np.int64)
++    point2D_idx_of[frame_order] = np.arange(P) - frame_starts[frame_of[frame_order]]
+ 
+     camera = None
+     # frame idx
+@@ -257,25 +265,14 @@ def batch_np_matrix_to_pycolmap_wo_track(
+             id=fidx + 1, name=f"image_{fidx + 1}", camera_id=camera.camera_id, cam_from_world=cam_from_world
+         )
+ 
+-        points2D_list = []
+-
+-        point2D_idx = 0
+-
+-        points_belong_to_fidx = points_xyf[:, 2].astype(np.int32) == fidx
+-        points_belong_to_fidx = np.nonzero(points_belong_to_fidx)[0]
++        # the frame's points, in the same order the track elements above assumed
++        points_belong_to_fidx = frame_order[frame_starts[fidx] : frame_starts[fidx + 1]]
++        frame_xy = points_xyf[points_belong_to_fidx, :2]
+ 
+-        for point3D_batch_idx in points_belong_to_fidx:
+-            point3D_id = point3D_batch_idx + 1
+-            point2D_xyf = points_xyf[point3D_batch_idx]
+-            point2D_xy = point2D_xyf[:2]
+-            points2D_list.append(pycolmap.Point2D(point2D_xy, point3D_id))
+-
+-            # add element
+-            track = reconstruction.points3D[point3D_id].track
+-            track.add_element(fidx + 1, point2D_idx)
+-            point2D_idx += 1
+-
+-        assert point2D_idx == len(points2D_list)
++        # Deliberately WITHOUT a point3D id: add_point3D below is what links each
++        # observation to its point, and it refuses to link one that already has a
++        # point3D (Reconstruction::AddPoint3D, reconstruction.cc:143).
++        points2D_list = [pycolmap.Point2D(xy) for xy in frame_xy]
+ 
+         try:
+             image.points2D = pycolmap.ListPoint2D(points2D_list)
+@@ -287,6 +284,15 @@ def batch_np_matrix_to_pycolmap_wo_track(
+         # add image
+         reconstruction.add_image(image)
+ 
++    # Points last: a track element names an image AND an index into that image's
++    # points2D, and add_point3D resolves both when the point is added, so the images
++    # and their observations both have to be in the reconstruction first. Point ids
++    # come out 1..P in this order, which is what points2D above assumes.
++    for vidx in range(P):
++        track = pycolmap.Track()
++        track.add_element(int(frame_of[vidx]) + 1, int(point2D_idx_of[vidx]))
++        reconstruction.add_point3D(points3d[vidx], track, points_rgb[vidx])
++
+     return reconstruction
+ 
+ 
+diff --git a/vggt/utils/geometry.py b/vggt/utils/geometry.py
+index f555516..6d3a859 100644
+--- a/vggt/utils/geometry.py
++++ b/vggt/utils/geometry.py
+@@ -13,7 +13,7 @@ from vggt.dependency.distortion import apply_distortion, iterative_undistortion,
+ 
+ 
+ def unproject_depth_map_to_point_map(
+-    depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray
++    depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray, return_tensor: bool = False
+ ) -> np.ndarray:
+     """
+     Unproject a batch of depth maps to 3D world coordinates.
+@@ -26,6 +26,14 @@ def unproject_depth_map_to_point_map(
+     Returns:
+         np.ndarray: Batch of 3D world coordinates of shape (S, H, W, 3)
+     """
++    # Already on a device: do the whole batch there in one expression rather than
++    # copying (S, H, W) floats to the host to run the loop below. Same arithmetic,
++    # same result shape and dtype. return_tensor keeps the result there too, for
++    # callers that are about to filter it (see helper.select_confident_points).
++    if isinstance(depth_map, torch.Tensor) and depth_map.is_cuda:
++        world_points = _opt_1(depth_map, extrinsics_cam, intrinsics_cam)
++        return world_points if return_tensor else world_points.cpu().numpy()
++
+     if isinstance(depth_map, torch.Tensor):
+         depth_map = depth_map.cpu().numpy()
+     if isinstance(extrinsics_cam, torch.Tensor):
+@@ -44,6 +52,29 @@ def unproject_depth_map_to_point_map(
+     return world_points_array
+ 
+ 
++def _opt_1(depth_map, extrinsics_cam, intrinsics_cam) -> np.ndarray:
++    depth = depth_map.squeeze(-1).float() if depth_map.dim() == 4 else depth_map.float()
++    extrinsics_cam = torch.as_tensor(extrinsics_cam, device=depth.device).float()
++    intrinsics_cam = torch.as_tensor(intrinsics_cam, device=depth.device).float()
++
++    _, H, W = depth.shape
++    v, u = torch.meshgrid(
++        torch.arange(H, device=depth.device, dtype=torch.float32),
++        torch.arange(W, device=depth.device, dtype=torch.float32),
++        indexing="ij",
++    )
++    fu, fv = intrinsics_cam[:, 0, 0][:, None, None], intrinsics_cam[:, 1, 1][:, None, None]
++    cu, cv = intrinsics_cam[:, 0, 2][:, None, None], intrinsics_cam[:, 1, 2][:, None, None]
++    cam_coords = torch.stack(
++        ((u[None] - cu) * depth / fu, (v[None] - cv) * depth / fv, depth), dim=-1
++    )
++
++    # closed_form_inverse_se3: R_cam_to_world = R^T, t_cam_to_world = -R^T @ t
++    r_cam_to_world = extrinsics_cam[:, :3, :3].transpose(1, 2)
++    t_cam_to_world = -torch.einsum("sij,sj->si", r_cam_to_world, extrinsics_cam[:, :3, 3])
++    return torch.einsum("shwj,sij->shwi", cam_coords, r_cam_to_world) + t_cam_to_world[:, None, None, :]
++
++
+ def depth_to_world_coords_points(
+     depth_map: np.ndarray,
+     extrinsic: np.ndarray,
+diff --git a/vggt/utils/helper.py b/vggt/utils/helper.py
+index 7b01918..6466819 100644
+--- a/vggt/utils/helper.py
++++ b/vggt/utils/helper.py
+@@ -5,6 +5,7 @@
+ # LICENSE file in the root directory of this source tree.
+ 
+ import numpy as np
++import torch
+ 
+ 
+ def randomly_limit_trues(mask: np.ndarray, max_trues: int) -> np.ndarray:
+@@ -58,3 +59,54 @@ def create_pixel_coordinate_grid(num_frames, height, width):
+     points_xyf = np.stack((x_coords, y_coords, f_coords), axis=-1)
+ 
+     return points_xyf
++
++
++def select_confident_points(points_3d, depth_conf, points_rgb, conf_thres_value, max_points, seed=42):
++    """Keep at most max_points pixels whose depth confidence clears the threshold.
++
++    This is create_pixel_coordinate_grid + a boolean mask + randomly_limit_trues +
++    three gathers, done in one pass. When the inputs are CUDA tensors it runs on the
++    device and only the selected rows cross PCIe, instead of copying the whole
++    (S, H, W, 3) point map and confidence map back to the host to build an 80 MB
++    coordinate grid there. The pixel coordinates are arithmetic on the flat index,
++    so that grid is never materialized at all.
++
++    Args:
++        points_3d: (S, H, W, 3) world points, torch tensor or numpy array
++        depth_conf: (S, H, W) confidence, same kind as points_3d
++        points_rgb: (S, H, W, 3) uint8 colours, same kind as points_3d
++        conf_thres_value: keep pixels whose confidence is >= this
++        max_points: cap on the number of points kept
++        seed: seeds the subsample taken when more pixels qualify than the cap allows
++
++    Returns:
++        (points_3d, points_xyf, points_rgb) as numpy arrays, in ascending pixel order
++    """
++    if not isinstance(depth_conf, torch.Tensor):
++        points_xyf = create_pixel_coordinate_grid(*depth_conf.shape)
++        conf_mask = depth_conf >= conf_thres_value
++        conf_mask = randomly_limit_trues(conf_mask, max_points)
++        return points_3d[conf_mask], points_xyf[conf_mask], points_rgb[conf_mask]
++
++    num_frames, height, width = depth_conf.shape
++    flat = (depth_conf >= conf_thres_value).reshape(-1).nonzero(as_tuple=False).squeeze(1)
++    if flat.numel() > max_points:
++        generator = torch.Generator(device=flat.device)
++        generator.manual_seed(seed)
++        pick = torch.randperm(flat.numel(), device=flat.device, generator=generator)[:max_points]
++        flat = torch.sort(flat[pick]).values  # ascending, like the boolean mask it replaces
++
++    within_frame = flat % (height * width)
++    points_xyf = torch.stack(
++        (
++            (within_frame % width).float(),
++            (within_frame // width).float(),
++            (flat // (height * width)).float(),
++        ),
++        dim=1,
++    )
++    return (
++        points_3d.reshape(-1, 3)[flat].cpu().numpy(),
++        points_xyf.cpu().numpy(),
++        points_rgb.reshape(-1, 3)[flat].cpu().numpy(),
++    )
+diff --git a/vggt/utils/load_fn.py b/vggt/utils/load_fn.py
+index 4d223aa..d3ba087 100644
+--- a/vggt/utils/load_fn.py
++++ b/vggt/utils/load_fn.py
+@@ -4,13 +4,59 @@
+ # This source code is licensed under the license found in the
+ # LICENSE file in the root directory of this source tree.
+ 
++import os
++from concurrent.futures import ThreadPoolExecutor
++
+ import torch
+ from PIL import Image
+ from torchvision import transforms as TF
+ import numpy as np
+ 
+ 
+-def load_and_preprocess_images_square(image_path_list, target_size=1024):
++def _load_and_pad_square(image_path, target_size):
++    to_tensor = TF.ToTensor()
++
++    # Open image
++    img = Image.open(image_path)
++
++    # If there's an alpha channel, blend onto white background
++    if img.mode == "RGBA":
++        background = Image.new("RGBA", img.size, (255, 255, 255, 255))
++        img = Image.alpha_composite(background, img)
++
++    # Convert to RGB
++    img = img.convert("RGB")
++
++    # Get original dimensions
++    width, height = img.size
++
++    # Make the image square by padding the shorter dimension
++    max_dim = max(width, height)
++
++    # Calculate padding
++    left = (max_dim - width) // 2
++    top = (max_dim - height) // 2
++
++    # Calculate scale factor for resizing
++    scale = target_size / max_dim
++
++    # Calculate final coordinates of original image in target space
++    x1 = left * scale
++    y1 = top * scale
++    x2 = (left + width) * scale
++    y2 = (top + height) * scale
++
++    # Create a new black square image and paste original
++    square_img = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
++    square_img.paste(img, (left, top))
++
++    # Resize to target size
++    square_img = square_img.resize((target_size, target_size), Image.Resampling.BICUBIC)
++
++    return to_tensor(square_img), np.array([x1, y1, x2, y2, width, height])
++
++
++def load_and_preprocess_images_square(image_path_list, target_size=1024, num_threads=None):
+     """
+     Load and preprocess images by center padding to square and resizing to target size.
+     Also returns the position information of original pixels after transformation.
+@@ -18,6 +64,8 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
+     Args:
+         image_path_list (list): List of paths to image files
+         target_size (int, optional): Target size for both width and height. Defaults to 518.
++        num_threads (int, optional): Threads used to decode and resize. Defaults to
++            one per image, capped at 16 and at the core count. Pass 1 to load serially.
+ 
+     Returns:
+         tuple: (
+@@ -32,58 +80,17 @@ def load_and_preprocess_images_square(image_path_list, target_size=1024):
+     if len(image_path_list) == 0:
+         raise ValueError("At least 1 image is required")
+ 
+-    images = []
+-    original_coords = []  # Renamed from position_info to be more descriptive
+-    to_tensor = TF.ToTensor()
+-
+-    for image_path in image_path_list:
+-        # Open image
+-        img = Image.open(image_path)
+-
+-        # If there's an alpha channel, blend onto white background
+-        if img.mode == "RGBA":
+-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+-            img = Image.alpha_composite(background, img)
+-
+-        # Convert to RGB
+-        img = img.convert("RGB")
+-
+-        # Get original dimensions
+-        width, height = img.size
+-
+-        # Make the image square by padding the shorter dimension
+-        max_dim = max(width, height)
+-
+-        # Calculate padding
+-        left = (max_dim - width) // 2
+-        top = (max_dim - height) // 2
+-
+-        # Calculate scale factor for resizing
+-        scale = target_size / max_dim
+-
+-        # Calculate final coordinates of original image in target space
+-        x1 = left * scale
+-        y1 = top * scale
+-        x2 = (left + width) * scale
+-        y2 = (top + height) * scale
+-
+-        # Store original image coordinates and scale
+-        original_coords.append(np.array([x1, y1, x2, y2, width, height]))
+-
+-        # Create a new black square image and paste original
+-        square_img = Image.new("RGB", (max_dim, max_dim), (0, 0, 0))
+-        square_img.paste(img, (left, top))
+-
+-        # Resize to target size
+-        square_img = square_img.resize((target_size, target_size), Image.Resampling.BICUBIC)
+-
+-        # Convert to tensor
+-        img_tensor = to_tensor(square_img)
+-        images.append(img_tensor)
++    if num_threads is None:
++        num_threads = min(16, len(image_path_list), os.cpu_count() or 8)
++    if num_threads > 1:
++        with ThreadPoolExecutor(max_workers=num_threads) as pool:
++            loaded = list(pool.map(lambda p: _load_and_pad_square(p, target_size), image_path_list))
++    else:
++        loaded = [_load_and_pad_square(p, target_size) for p in image_path_list]
+ 
+     # Stack all images
+-    images = torch.stack(images)
+-    original_coords = torch.from_numpy(np.array(original_coords)).float()
++    images = torch.stack([img_tensor for img_tensor, _ in loaded])
++    original_coords = torch.from_numpy(np.array([coords for _, coords in loaded])).float()
+ 
+     # Add additional dimension if single image to ensure correct shape
+     if len(image_path_list) == 1:

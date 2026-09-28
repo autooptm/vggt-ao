@@ -13,7 +13,7 @@ from vggt.dependency.distortion import apply_distortion, iterative_undistortion,
 
 
 def unproject_depth_map_to_point_map(
-    depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray
+    depth_map: np.ndarray, extrinsics_cam: np.ndarray, intrinsics_cam: np.ndarray, return_tensor: bool = False
 ) -> np.ndarray:
     """
     Unproject a batch of depth maps to 3D world coordinates.
@@ -26,6 +26,14 @@ def unproject_depth_map_to_point_map(
     Returns:
         np.ndarray: Batch of 3D world coordinates of shape (S, H, W, 3)
     """
+    # Already on a device: do the whole batch there in one expression rather than
+    # copying (S, H, W) floats to the host to run the loop below. Same arithmetic,
+    # same result shape and dtype. return_tensor keeps the result there too, for
+    # callers that are about to filter it (see helper.select_confident_points).
+    if isinstance(depth_map, torch.Tensor) and depth_map.is_cuda:
+        world_points = _opt_1(depth_map, extrinsics_cam, intrinsics_cam)
+        return world_points if return_tensor else world_points.cpu().numpy()
+
     if isinstance(depth_map, torch.Tensor):
         depth_map = depth_map.cpu().numpy()
     if isinstance(extrinsics_cam, torch.Tensor):
@@ -42,6 +50,29 @@ def unproject_depth_map_to_point_map(
     world_points_array = np.stack(world_points_list, axis=0)
 
     return world_points_array
+
+
+def _opt_1(depth_map, extrinsics_cam, intrinsics_cam) -> np.ndarray:
+    depth = depth_map.squeeze(-1).float() if depth_map.dim() == 4 else depth_map.float()
+    extrinsics_cam = torch.as_tensor(extrinsics_cam, device=depth.device).float()
+    intrinsics_cam = torch.as_tensor(intrinsics_cam, device=depth.device).float()
+
+    _, H, W = depth.shape
+    v, u = torch.meshgrid(
+        torch.arange(H, device=depth.device, dtype=torch.float32),
+        torch.arange(W, device=depth.device, dtype=torch.float32),
+        indexing="ij",
+    )
+    fu, fv = intrinsics_cam[:, 0, 0][:, None, None], intrinsics_cam[:, 1, 1][:, None, None]
+    cu, cv = intrinsics_cam[:, 0, 2][:, None, None], intrinsics_cam[:, 1, 2][:, None, None]
+    cam_coords = torch.stack(
+        ((u[None] - cu) * depth / fu, (v[None] - cv) * depth / fv, depth), dim=-1
+    )
+
+    # closed_form_inverse_se3: R_cam_to_world = R^T, t_cam_to_world = -R^T @ t
+    r_cam_to_world = extrinsics_cam[:, :3, :3].transpose(1, 2)
+    t_cam_to_world = -torch.einsum("sij,sj->si", r_cam_to_world, extrinsics_cam[:, :3, 3])
+    return torch.einsum("shwj,sij->shwi", cam_coords, r_cam_to_world) + t_cam_to_world[:, None, None, :]
 
 
 def depth_to_world_coords_points(
